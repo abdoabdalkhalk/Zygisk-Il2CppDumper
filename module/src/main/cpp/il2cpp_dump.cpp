@@ -30,10 +30,10 @@ void init_il2cpp_api(void *handle) {
 #undef DO_API
 }
 
-static std::string get_type_name(const Il2CppType *type, bool include_namespace = false);
+static std::string get_type_name(const Il2CppType *type);
 
-static const char* primitive_type_name(int type_enum) {
-    switch (type_enum) {
+static const char* primitive_type_name(int t) {
+    switch (t) {
         case IL2CPP_TYPE_VOID:       return "void";
         case IL2CPP_TYPE_BOOLEAN:    return "bool";
         case IL2CPP_TYPE_CHAR:       return "char";
@@ -66,7 +66,7 @@ static std::string get_class_name_clean(Il2CppClass *klass) {
     return s;
 }
 
-static std::string get_class_name_with_namespace(Il2CppClass *klass) {
+static std::string get_class_fullname(Il2CppClass *klass) {
     if (!klass) return "?";
     const char *ns = il2cpp_class_get_namespace(klass);
     std::string name = get_class_name_clean(klass);
@@ -74,34 +74,34 @@ static std::string get_class_name_with_namespace(Il2CppClass *klass) {
     return name;
 }
 
-static std::string map_system_type(const std::string &fullname) {
-    if (fullname == "System.Void")    return "void";
-    if (fullname == "System.Boolean") return "bool";
-    if (fullname == "System.Char")    return "char";
-    if (fullname == "System.SByte")   return "sbyte";
-    if (fullname == "System.Byte")    return "byte";
-    if (fullname == "System.Int16")   return "short";
-    if (fullname == "System.UInt16")  return "ushort";
-    if (fullname == "System.Int32")   return "int";
-    if (fullname == "System.UInt32")  return "uint";
-    if (fullname == "System.Int64")   return "long";
-    if (fullname == "System.UInt64")  return "ulong";
-    if (fullname == "System.Single")  return "float";
-    if (fullname == "System.Double")  return "double";
-    if (fullname == "System.String")  return "string";
-    if (fullname == "System.Object")  return "object";
-    if (fullname == "System.IntPtr")  return "IntPtr";
-    if (fullname == "System.UIntPtr") return "UIntPtr";
+static std::string map_system_type(const std::string &full) {
+    if (full == "System.Void")    return "void";
+    if (full == "System.Boolean") return "bool";
+    if (full == "System.Char")    return "char";
+    if (full == "System.SByte")   return "sbyte";
+    if (full == "System.Byte")    return "byte";
+    if (full == "System.Int16")   return "short";
+    if (full == "System.UInt16")  return "ushort";
+    if (full == "System.Int32")   return "int";
+    if (full == "System.UInt32")  return "uint";
+    if (full == "System.Int64")   return "long";
+    if (full == "System.UInt64")  return "ulong";
+    if (full == "System.Single")  return "float";
+    if (full == "System.Double")  return "double";
+    if (full == "System.String")  return "string";
+    if (full == "System.Object")  return "object";
+    if (full == "System.IntPtr")  return "IntPtr";
+    if (full == "System.UIntPtr") return "UIntPtr";
     return "";
 }
 
-static std::string get_type_name(const Il2CppType *type, bool include_namespace) {
+static std::string get_type_name(const Il2CppType *type) {
     if (!type) return "?";
 
-    const char *prim = primitive_type_name(type->type);
+    const char *prim = primitive_type_name((int)type->type);
     if (prim) return prim;
 
-    switch (type->type) {
+    switch ((int)type->type) {
 
         case IL2CPP_TYPE_SZARRAY: {
             const Il2CppType *elem = (const Il2CppType *)type->data.type;
@@ -150,30 +150,21 @@ static std::string get_type_name(const Il2CppType *type, bool include_namespace)
             if (!def_klass) def_klass = il2cpp_class_from_type(type);
             if (!def_klass) return "?";
 
-            std::string fullname = get_class_name_with_namespace(def_klass);
-            std::string mapped = map_system_type(fullname);
-            std::string base_name;
-            if (!mapped.empty()) {
-                base_name = mapped;
-            } else {
-                base_name = get_class_name_clean(def_klass);
-            }
+            std::string full = get_class_fullname(def_klass);
+            std::string mapped = map_system_type(full);
+            std::string base = mapped.empty() ? get_class_name_clean(def_klass) : mapped;
 
             const Il2CppGenericInst *inst = gclass->context.class_inst;
             if (inst && inst->type_argc > 0 && inst->type_argv) {
-                base_name += "<";
+                base += "<";
                 for (uint32_t i = 0; i < inst->type_argc; i++) {
-                    if (i > 0) base_name += ", ";
-                    const Il2CppType *arg_type = inst->type_argv[i];
-                    if (arg_type) {
-                        base_name += get_type_name(arg_type);
-                    } else {
-                        base_name += "?";
-                    }
+                    if (i > 0) base += ", ";
+                    const Il2CppType *arg = inst->type_argv[i];
+                    base += arg ? get_type_name(arg) : "?";
                 }
-                base_name += ">";
+                base += ">";
             }
-            return base_name;
+            return base;
         }
 
         case IL2CPP_TYPE_VAR:
@@ -190,11 +181,9 @@ static std::string get_type_name(const Il2CppType *type, bool include_namespace)
         case IL2CPP_TYPE_VALUETYPE: {
             Il2CppClass *k = il2cpp_class_from_type(type);
             if (!k) return "?";
-            std::string fullname = get_class_name_with_namespace(k);
-            std::string mapped = map_system_type(fullname);
-            if (!mapped.empty()) return mapped;
-            if (include_namespace) return fullname;
-            return get_class_name_clean(k);
+            std::string full = get_class_fullname(k);
+            std::string mapped = map_system_type(full);
+            return mapped.empty() ? get_class_name_clean(k) : mapped;
         }
 
         default:
@@ -203,10 +192,9 @@ static std::string get_type_name(const Il2CppType *type, bool include_namespace)
 
     Il2CppClass *k = il2cpp_class_from_type(type);
     if (!k) return "?";
-    std::string fullname = get_class_name_with_namespace(k);
-    std::string mapped = map_system_type(fullname);
-    if (!mapped.empty()) return mapped;
-    return get_class_name_clean(k);
+    std::string full = get_class_fullname(k);
+    std::string mapped = map_system_type(full);
+    return mapped.empty() ? get_class_name_clean(k) : mapped;
 }
 
 std::string get_method_modifier(uint32_t flags) {
@@ -265,11 +253,11 @@ std::string dump_method(Il2CppClass *klass) {
             auto p = il2cpp_method_get_param(method, i);
             auto a = p->attrs;
             if (_il2cpp_type_is_byref(p)) {
-                if (a & PARAM_ATTRIBUTE_OUT && !(a & PARAM_ATTRIBUTE_IN)) out << "out ";
-                else if (a & PARAM_ATTRIBUTE_IN && !(a & PARAM_ATTRIBUTE_OUT)) out << "in ";
+                if      (a & PARAM_ATTRIBUTE_OUT && !(a & PARAM_ATTRIBUTE_IN)) out << "out ";
+                else if (a & PARAM_ATTRIBUTE_IN  && !(a & PARAM_ATTRIBUTE_OUT)) out << "in ";
                 else out << "ref ";
             } else {
-                if (a & PARAM_ATTRIBUTE_IN) out << "[In] ";
+                if (a & PARAM_ATTRIBUTE_IN)  out << "[In] ";
                 if (a & PARAM_ATTRIBUTE_OUT) out << "[Out] ";
             }
             out << get_type_name(p) << " " << il2cpp_method_get_param_name(method, i);
@@ -284,10 +272,12 @@ std::string dump_property(Il2CppClass *klass) {
     std::stringstream out;
     out << "\n\t// Properties\n";
     void *iter = nullptr;
-    while (auto prop = il2cpp_class_get_properties(klass, &iter)) {
-        auto get = il2cpp_property_get_get_method(prop);
-        auto set = il2cpp_property_get_set_method(prop);
+    while (auto prop_const = il2cpp_class_get_properties(klass, &iter)) {
+        auto prop = const_cast<PropertyInfo *>(prop_const);
+        auto get  = il2cpp_property_get_get_method(prop);
+        auto set  = il2cpp_property_get_set_method(prop);
         const char *name = il2cpp_property_get_name(prop);
+        if (!name) continue;
         out << "\t";
         uint32_t iflags = 0;
         if (get) {
@@ -299,6 +289,8 @@ std::string dump_property(Il2CppClass *klass) {
             out << get_method_modifier(il2cpp_method_get_flags(set, &iflags));
             out << get_type_name(il2cpp_method_get_param(set, 0)) << " " << name << " { ";
             out << "set; ";
+        } else {
+            continue;
         }
         out << "}\n";
     }
@@ -314,16 +306,16 @@ std::string dump_field(Il2CppClass *klass) {
         out << "\t";
         uint32_t attrs = il2cpp_field_get_flags(field);
         switch (attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK) {
-            case FIELD_ATTRIBUTE_PRIVATE: out << "private "; break;
-            case FIELD_ATTRIBUTE_PUBLIC:  out << "public "; break;
-            case FIELD_ATTRIBUTE_FAMILY:  out << "protected "; break;
+            case FIELD_ATTRIBUTE_PRIVATE:            out << "private "; break;
+            case FIELD_ATTRIBUTE_PUBLIC:             out << "public "; break;
+            case FIELD_ATTRIBUTE_FAMILY:             out << "protected "; break;
             case FIELD_ATTRIBUTE_ASSEMBLY:
-            case FIELD_ATTRIBUTE_FAM_AND_ASSEM: out << "internal "; break;
-            case FIELD_ATTRIBUTE_FAM_OR_ASSEM:  out << "protected internal "; break;
+            case FIELD_ATTRIBUTE_FAM_AND_ASSEM:      out << "internal "; break;
+            case FIELD_ATTRIBUTE_FAM_OR_ASSEM:       out << "protected internal "; break;
         }
         if (attrs & FIELD_ATTRIBUTE_LITERAL) out << "const ";
         else {
-            if (attrs & FIELD_ATTRIBUTE_STATIC) out << "static ";
+            if (attrs & FIELD_ATTRIBUTE_STATIC)    out << "static ";
             if (attrs & FIELD_ATTRIBUTE_INIT_ONLY) out << "readonly ";
         }
         out << get_type_name(il2cpp_field_get_type(field)) << " " << il2cpp_field_get_name(field);
@@ -347,21 +339,21 @@ std::string dump_type(const Il2CppType *type, int typeDefIndex) {
     bool en = il2cpp_class_is_enum(klass);
     switch (flags & TYPE_ATTRIBUTE_VISIBILITY_MASK) {
         case TYPE_ATTRIBUTE_PUBLIC:
-        case TYPE_ATTRIBUTE_NESTED_PUBLIC:       out << "public "; break;
+        case TYPE_ATTRIBUTE_NESTED_PUBLIC:        out << "public "; break;
         case TYPE_ATTRIBUTE_NOT_PUBLIC:
         case TYPE_ATTRIBUTE_NESTED_FAM_AND_ASSEM:
-        case TYPE_ATTRIBUTE_NESTED_ASSEMBLY:     out << "internal "; break;
-        case TYPE_ATTRIBUTE_NESTED_PRIVATE:      out << "private "; break;
-        case TYPE_ATTRIBUTE_NESTED_FAMILY:       out << "protected "; break;
-        case TYPE_ATTRIBUTE_NESTED_FAM_OR_ASSEM: out << "protected internal "; break;
+        case TYPE_ATTRIBUTE_NESTED_ASSEMBLY:      out << "internal "; break;
+        case TYPE_ATTRIBUTE_NESTED_PRIVATE:       out << "private "; break;
+        case TYPE_ATTRIBUTE_NESTED_FAMILY:        out << "protected "; break;
+        case TYPE_ATTRIBUTE_NESTED_FAM_OR_ASSEM:  out << "protected internal "; break;
     }
-    if (flags & TYPE_ATTRIBUTE_ABSTRACT && flags & TYPE_ATTRIBUTE_SEALED) out << "static ";
+    if      (flags & TYPE_ATTRIBUTE_ABSTRACT && flags & TYPE_ATTRIBUTE_SEALED) out << "static ";
     else if (!(flags & TYPE_ATTRIBUTE_INTERFACE) && flags & TYPE_ATTRIBUTE_ABSTRACT) out << "abstract ";
     else if (!vt && !en && flags & TYPE_ATTRIBUTE_SEALED) out << "sealed ";
-    if (flags & TYPE_ATTRIBUTE_INTERFACE) out << "interface ";
-    else if (en) out << "enum ";
-    else if (vt) out << "struct ";
-    else out << "class ";
+    if      (flags & TYPE_ATTRIBUTE_INTERFACE) out << "interface ";
+    else if (en)  out << "enum ";
+    else if (vt)  out << "struct ";
+    else          out << "class ";
 
     out << get_type_name(type);
 
@@ -405,20 +397,57 @@ void il2cpp_dump(const char *outDir) {
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
+
     std::stringstream header;
     for (int i = 0; i < (int)size; i++)
-        header << "// Image " << i << ": " << il2cpp_image_get_name(il2cpp_assembly_get_image(assemblies[i])) << "\n";
+        header << "// Image " << i << ": "
+               << il2cpp_image_get_name(il2cpp_assembly_get_image(assemblies[i])) << "\n";
 
     std::vector<std::string> lines;
     int idx = 0;
+
     if (il2cpp_image_get_class) {
+        LOGI("Version greater than 2018.3");
         for (int i = 0; i < (int)size; i++) {
             auto img = il2cpp_assembly_get_image(assemblies[i]);
             std::string ih = std::string("\n// Dll : ") + il2cpp_image_get_name(img);
-            for (int j = 0; j < (int)il2cpp_image_get_class_count(img); j++)
-                lines.push_back(ih + dump_type(il2cpp_class_get_type(il2cpp_image_get_class(img, j)), idx++));
+            size_t count = il2cpp_image_get_class_count(img);
+            for (int j = 0; j < (int)count; j++) {
+                auto klass = const_cast<Il2CppClass *>(il2cpp_image_get_class(img, j));
+                auto type  = il2cpp_class_get_type(klass);
+                lines.push_back(ih + dump_type(type, idx++));
+            }
+        }
+    } else {
+        LOGI("Version less than 2018.3");
+        auto corlib       = il2cpp_get_corlib();
+        auto asmClass     = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
+        auto loadMethod   = il2cpp_class_get_method_from_name(asmClass, "Load", 1);
+        auto getTypesMethod = il2cpp_class_get_method_from_name(asmClass, "GetTypes", 0);
+        if (!loadMethod || !loadMethod->methodPointer)       { LOGI("miss Assembly::Load"); return; }
+        if (!getTypesMethod || !getTypesMethod->methodPointer) { LOGI("miss Assembly::GetTypes"); return; }
+
+        typedef void        *(*LoadFn)(void *, Il2CppString *, void *);
+        typedef Il2CppArray *(*GetTypesFn)(void *, void *);
+
+        for (int i = 0; i < (int)size; i++) {
+            auto img  = il2cpp_assembly_get_image(assemblies[i]);
+            std::string ih = std::string("\n// Dll : ") + il2cpp_image_get_name(img);
+            auto nameNoExt = std::string(il2cpp_image_get_name(img));
+            auto dot = nameNoExt.rfind('.');
+            if (dot != std::string::npos) nameNoExt = nameNoExt.substr(0, dot);
+            auto str    = il2cpp_string_new(nameNoExt.c_str());
+            auto asmObj = ((LoadFn)loadMethod->methodPointer)(nullptr, str, nullptr);
+            auto typesArray = ((GetTypesFn)getTypesMethod->methodPointer)(asmObj, nullptr);
+            auto items = typesArray->vector;
+            for (int j = 0; j < (int)typesArray->max_length; j++) {
+                auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *)items[j]);
+                auto type  = il2cpp_class_get_type(klass);
+                lines.push_back(ih + dump_type(type, idx++));
+            }
         }
     }
+
     std::string path = std::string(outDir) + "/files/dump.cs";
     std::ofstream f(path);
     f << header.str();
