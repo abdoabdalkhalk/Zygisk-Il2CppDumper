@@ -30,6 +30,12 @@ void init_il2cpp_api(void *handle) {
 #undef DO_API
 }
 
+static std::string to_hex(uint64_t val) {
+    std::stringstream ss;
+    ss << std::hex << std::uppercase << val;
+    return ss.str();
+}
+
 static std::string get_type_name(const Il2CppType *type);
 
 static const char* primitive_type_name(int t) {
@@ -236,8 +242,8 @@ std::string dump_method(Il2CppClass *klass) {
     void *iter = nullptr;
     while (auto method = il2cpp_class_get_methods(klass, &iter)) {
         if (method->methodPointer) {
-            out << "\t// RVA: 0x" << std::hex << ((uint64_t)method->methodPointer - il2cpp_base)
-                << " VA: 0x" << (uint64_t)method->methodPointer;
+            out << "\t// RVA: 0x" << to_hex((uint64_t)method->methodPointer - il2cpp_base)
+                << " VA: 0x"      << to_hex((uint64_t)method->methodPointer);
         } else {
             out << "\t// RVA: 0x VA: 0x0";
         }
@@ -322,9 +328,9 @@ std::string dump_field(Il2CppClass *klass) {
         if ((attrs & FIELD_ATTRIBUTE_LITERAL) && is_enum) {
             uint64_t val = 0;
             il2cpp_field_static_get_value(field, &val);
-            out << " = " << std::dec << val;
+            out << " = " << val;
         }
-        out << "; // 0x" << std::hex << il2cpp_field_get_offset(field) << "\n";
+        out << "; // 0x" << to_hex((uint64_t)il2cpp_field_get_offset(field)) << "\n";
     }
     return out.str();
 }
@@ -371,7 +377,7 @@ std::string dump_type(const Il2CppType *type, int typeDefIndex) {
         out << " : " << extends[0];
         for (size_t i = 1; i < extends.size(); i++) out << ", " << extends[i];
     }
-    out << " // TypeDefIndex: " << std::dec << typeDefIndex << "\n{";
+    out << " // TypeDefIndex: " << typeDefIndex << "\n{";
     out << dump_field(klass);
     out << dump_property(klass);
     out << dump_method(klass);
@@ -420,26 +426,26 @@ void il2cpp_dump(const char *outDir) {
         }
     } else {
         LOGI("Version less than 2018.3");
-        auto corlib       = il2cpp_get_corlib();
-        auto asmClass     = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
-        auto loadMethod   = il2cpp_class_get_method_from_name(asmClass, "Load", 1);
+        auto corlib         = il2cpp_get_corlib();
+        auto asmClass       = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
+        auto loadMethod     = il2cpp_class_get_method_from_name(asmClass, "Load", 1);
         auto getTypesMethod = il2cpp_class_get_method_from_name(asmClass, "GetTypes", 0);
-        if (!loadMethod || !loadMethod->methodPointer)       { LOGI("miss Assembly::Load"); return; }
+        if (!loadMethod     || !loadMethod->methodPointer)     { LOGI("miss Assembly::Load");     return; }
         if (!getTypesMethod || !getTypesMethod->methodPointer) { LOGI("miss Assembly::GetTypes"); return; }
 
         typedef void        *(*LoadFn)(void *, Il2CppString *, void *);
         typedef Il2CppArray *(*GetTypesFn)(void *, void *);
 
         for (int i = 0; i < (int)size; i++) {
-            auto img  = il2cpp_assembly_get_image(assemblies[i]);
-            std::string ih = std::string("\n// Dll : ") + il2cpp_image_get_name(img);
-            auto nameNoExt = std::string(il2cpp_image_get_name(img));
-            auto dot = nameNoExt.rfind('.');
+            auto img        = il2cpp_assembly_get_image(assemblies[i]);
+            std::string ih  = std::string("\n// Dll : ") + il2cpp_image_get_name(img);
+            auto nameNoExt  = std::string(il2cpp_image_get_name(img));
+            auto dot        = nameNoExt.rfind('.');
             if (dot != std::string::npos) nameNoExt = nameNoExt.substr(0, dot);
-            auto str    = il2cpp_string_new(nameNoExt.c_str());
-            auto asmObj = ((LoadFn)loadMethod->methodPointer)(nullptr, str, nullptr);
+            auto str        = il2cpp_string_new(nameNoExt.c_str());
+            auto asmObj     = ((LoadFn)loadMethod->methodPointer)(nullptr, str, nullptr);
             auto typesArray = ((GetTypesFn)getTypesMethod->methodPointer)(asmObj, nullptr);
-            auto items = typesArray->vector;
+            auto items      = typesArray->vector;
             for (int j = 0; j < (int)typesArray->max_length; j++) {
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *)items[j]);
                 auto type  = il2cpp_class_get_type(klass);
