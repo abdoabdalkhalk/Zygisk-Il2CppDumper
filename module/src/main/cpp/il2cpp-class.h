@@ -141,3 +141,28 @@ typedef struct Il2CppArray {
     il2cpp_array_size_t max_length;
     void *vector[32];
 } Il2CppArray;
+
+typedef struct Il2CppGenericInst {
+    uint32_t type_argc;
+    const Il2CppType **type_argv;
+} Il2CppGenericInst;
+
+typedef struct Il2CppGenericContext {
+    const Il2CppGenericInst *class_inst;
+    const Il2CppGenericInst *method_inst;
+} Il2CppGenericContext;
+
+typedef struct Il2CppGenericClass {
+    const Il2CppType *type;
+    Il2CppGenericContext context;
+    Il2CppClass *cached_class;
+} Il2CppGenericClass;
+
+typedef struct Il2CppArrayType {
+    const Il2CppType *etype;
+    uint8_t rank;
+    uint8_t numsizes;
+    uint8_t numlobounds;
+    int *sizes;
+    int *lobounds;
+} Il2CppArrayType;
