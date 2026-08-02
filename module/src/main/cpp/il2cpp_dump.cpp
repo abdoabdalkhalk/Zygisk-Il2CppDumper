@@ -30,32 +30,26 @@ void init_il2cpp_api(void *handle) {
 #undef DO_API
 }
 
-static std::string sanitize_type_name(const std::string &name) {
-    int open  = 0;
-    int close = 0;
+// strips trailing unmatched '>' from obfuscated class names
+// e.g. "OBHKEJHFBIP>" -> "OBHKEJHFBIP"
+// but "List<int>" stays "List<int>"
+static std::string strip_unmatched_brackets(const std::string &name) {
+    int open = 0;
     for (char c : name) {
         if (c == '<') open++;
-        if (c == '>') close++;
+        else if (c == '>') open--;
     }
-    if (open == close) return name;
-    if (close > open) {
-        std::string result = name;
-        int extra = close - open;
-        for (int i = (int)result.size() - 1; i >= 0 && extra > 0; i--) {
-            if (result[i] == '>') {
-                result.erase(i, 1);
-                extra--;
-            }
+    // open < 0 means more '>' than '<' -> strip trailing '>'
+    if (open >= 0) return name;
+    std::string result = name;
+    int extra = -open;
+    for (int i = (int)result.size() - 1; i >= 0 && extra > 0; i--) {
+        if (result[i] == '>') {
+            result.erase(i, 1);
+            extra--;
         }
-        return result;
     }
-    if (open > close) {
-        std::string result = name;
-        int extra = open - close;
-        for (int i = 0; i < extra; i++) result += '>';
-        return result;
-    }
-    return name;
+    return result;
 }
 
 static const char* primitive_type_name(Il2CppTypeEnum type) {
@@ -92,7 +86,100 @@ static std::string get_class_name_no_tick(Il2CppClass *klass) {
     if (tick != std::string::npos) {
         name = name.substr(0, tick);
     }
-    return sanitize_type_name(name);
+    return strip_unmatched_brackets(name);
+}
+
+// converts a single dotnet type token (from il2cpp_type_get_name output) to C# name
+// input examples: "System.UInt32", "OBHKEJHFBIP", "[System.UInt32, mscorlib]"
+static std::string dotnet_token_to_csharp(const std::string &token) {
+    static const struct { const char *dotnet; const char *csharp; } map[] = {
+        {"System.Void",    "void"},
+        {"System.Boolean", "bool"},
+        {"System.Char",    "char"},
+        {"System.SByte",   "sbyte"},
+        {"System.Byte",    "byte"},
+        {"System.Int16",   "short"},
+        {"System.UInt16",  "ushort"},
+        {"System.Int32",   "int"},
+        {"System.UInt32",  "uint"},
+        {"System.Int64",   "long"},
+        {"System.UInt64",  "ulong"},
+        {"System.Single",  "float"},
+        {"System.Double",  "double"},
+        {"System.String",  "string"},
+        {"System.Object",  "object"},
+        {"System.IntPtr",  "IntPtr"},
+        {"System.UIntPtr", "UIntPtr"},
+        {nullptr, nullptr}
+    };
+
+    std::string t = token;
+
+    // trim leading spaces
+    while (!t.empty() && t[0] == ' ') t = t.substr(1);
+
+    // unwrap "[TypeName, Assembly]" -> "TypeName"
+    if (!t.empty() && t[0] == '[') {
+        // find the matching closing bracket at depth 1
+        // but if it's a nested generic like "[Outer`1[[Inner, Asm]], Asm]"
+        // we only want the first comma at depth 1
+        int depth = 0;
+        size_t comma_pos = std::string::npos;
+        for (size_t i = 0; i < t.size(); i++) {
+            if (t[i] == '[') depth++;
+            else if (t[i] == ']') depth--;
+            else if (t[i] == ',' && depth == 1) {
+                comma_pos = i;
+                break;
+            }
+        }
+        if (comma_pos != std::string::npos)
+            t = t.substr(1, comma_pos - 1);
+        else
+            t = t.substr(1, t.size() - 2);
+        while (!t.empty() && t[0] == ' ') t = t.substr(1);
+    }
+
+    // check dotnet -> csharp map
+    for (int i = 0; map[i].dotnet; i++) {
+        if (t == map[i].dotnet) return map[i].csharp;
+    }
+
+    // strip namespace: take part after last '.' before any '`' or '<'
+    auto generic_start = t.find_first_of("`<");
+    std::string prefix = (generic_start != std::string::npos) ? t.substr(0, generic_start) : t;
+    auto last_dot = prefix.rfind('.');
+    if (last_dot != std::string::npos) {
+        t = t.substr(last_dot + 1);
+    }
+
+    // strip backtick
+    auto tick = t.find('`');
+    if (tick != std::string::npos) t = t.substr(0, tick);
+
+    return strip_unmatched_brackets(t);
+}
+
+// parse comma-separated type args from il2cpp_type_get_name output
+// handles nested brackets: "[Outer`1[[Inner, Asm],[Inner2,Asm]], Asm], [Other, Asm]"
+static std::vector<std::string> split_type_args(const std::string &args_raw) {
+    std::vector<std::string> result;
+    int depth = 0;
+    std::string cur;
+    for (char c : args_raw) {
+        if      (c == '[') { depth++; cur += c; }
+        else if (c == ']') { depth--; cur += c; }
+        else if (c == ',' && depth == 0) {
+            while (!cur.empty() && cur[0] == ' ') cur = cur.substr(1);
+            if (!cur.empty()) result.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    while (!cur.empty() && cur[0] == ' ') cur = cur.substr(1);
+    if (!cur.empty()) result.push_back(cur);
+    return result;
 }
 
 static std::string get_type_name(const Il2CppType *type) {
@@ -104,14 +191,14 @@ static std::string get_type_name(const Il2CppType *type) {
     Il2CppClass *klass = nullptr;
 
     switch ((int)type->type) {
+
         case IL2CPP_TYPE_SZARRAY: {
             if (!il2cpp_class_from_type) break;
             klass = il2cpp_class_from_type(type);
             if (!klass) break;
             Il2CppClass *elem = il2cpp_class_get_element_class(klass);
             if (!elem) break;
-            const Il2CppType *elem_type = il2cpp_class_get_type(elem);
-            return get_type_name(elem_type) + "[]";
+            return get_type_name(il2cpp_class_get_type(elem)) + "[]";
         }
 
         case IL2CPP_TYPE_ARRAY: {
@@ -120,12 +207,10 @@ static std::string get_type_name(const Il2CppType *type) {
             if (!klass) break;
             Il2CppClass *elem = il2cpp_class_get_element_class(klass);
             if (!elem) break;
-            const Il2CppType *elem_type = il2cpp_class_get_type(elem);
             int rank = il2cpp_class_get_rank(klass);
-            std::string result = get_type_name(elem_type) + "[";
-            for (int i = 1; i < rank; i++) result += ",";
-            result += "]";
-            return result;
+            std::string r = get_type_name(il2cpp_class_get_type(elem)) + "[";
+            for (int i = 1; i < rank; i++) r += ",";
+            return r + "]";
         }
 
         case IL2CPP_TYPE_PTR: {
@@ -134,124 +219,78 @@ static std::string get_type_name(const Il2CppType *type) {
             if (!klass) break;
             Il2CppClass *elem = il2cpp_class_get_element_class(klass);
             if (!elem) break;
-            const Il2CppType *elem_type = il2cpp_class_get_type(elem);
-            return get_type_name(elem_type) + "*";
+            return get_type_name(il2cpp_class_get_type(elem)) + "*";
         }
 
         case IL2CPP_TYPE_GENERICINST: {
+            // try il2cpp_type_get_name first — gives us full dotnet name with args
             if (il2cpp_type_get_name) {
                 char *full = il2cpp_type_get_name(type);
                 if (full) {
                     std::string s(full);
                     il2cpp_free(full);
 
+                    // format: "Namespace.ClassName`N[arg1,arg2,...]"
+                    // or:     "Namespace.ClassName`N[[arg1,Asm],[arg2,Asm]]"
+
+                    // extract class name (after last dot, before backtick)
                     auto tick_pos = s.find('`');
                     std::string class_part;
                     if (tick_pos != std::string::npos) {
                         auto dot_pos = s.rfind('.', tick_pos);
-                        if (dot_pos != std::string::npos)
-                            class_part = s.substr(dot_pos + 1, tick_pos - dot_pos - 1);
-                        else
-                            class_part = s.substr(0, tick_pos);
+                        class_part = (dot_pos != std::string::npos)
+                            ? s.substr(dot_pos + 1, tick_pos - dot_pos - 1)
+                            : s.substr(0, tick_pos);
                     } else {
                         auto dot_pos = s.rfind('.');
-                        if (dot_pos != std::string::npos)
-                            class_part = s.substr(dot_pos + 1);
-                        else
-                            class_part = s;
+                        class_part = (dot_pos != std::string::npos)
+                            ? s.substr(dot_pos + 1)
+                            : s;
+                    }
+                    class_part = strip_unmatched_brackets(class_part);
+
+                    // find the args block "[...]"
+                    // the first '[' after the backtick number
+                    size_t args_open = std::string::npos;
+                    if (tick_pos != std::string::npos) {
+                        // skip the number after backtick
+                        size_t i = tick_pos + 1;
+                        while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+                        if (i < s.size() && s[i] == '[') args_open = i;
                     }
 
-                    auto open = s.find('[');
-                    auto close = s.rfind(']');
-                    if (open != std::string::npos && close != std::string::npos && close > open) {
-                        std::string args_raw = s.substr(open + 1, close - open - 1);
-
-                        std::string result = class_part + "<";
-
-                        std::vector<std::string> args;
+                    if (args_open != std::string::npos) {
+                        // find matching closing bracket
                         int depth = 0;
-                        std::string cur;
-                        for (char c : args_raw) {
-                            if (c == '[') { depth++; cur += c; }
-                            else if (c == ']') { depth--; cur += c; }
-                            else if (c == ',' && depth == 0) {
-                                while (!cur.empty() && cur[0] == ' ') cur = cur.substr(1);
-                                args.push_back(cur);
-                                cur.clear();
-                            } else {
-                                cur += c;
+                        size_t args_close = std::string::npos;
+                        for (size_t i = args_open; i < s.size(); i++) {
+                            if      (s[i] == '[') depth++;
+                            else if (s[i] == ']') {
+                                depth--;
+                                if (depth == 0) { args_close = i; break; }
                             }
                         }
-                        if (!cur.empty()) {
-                            while (!cur.empty() && cur[0] == ' ') cur = cur.substr(1);
-                            args.push_back(cur);
+                        if (args_close != std::string::npos) {
+                            std::string args_raw = s.substr(args_open + 1, args_close - args_open - 1);
+                            auto tokens = split_type_args(args_raw);
+                            std::string result = class_part + "<";
+                            for (int i = 0; i < (int)tokens.size(); i++) {
+                                if (i > 0) result += ", ";
+                                result += dotnet_token_to_csharp(tokens[i]);
+                            }
+                            result += ">";
+                            return result;
                         }
-
-                        static const struct { const char *dotnet; const char *csharp; } dotnet_to_csharp[] = {
-                            {"System.Void",    "void"},
-                            {"System.Boolean", "bool"},
-                            {"System.Char",    "char"},
-                            {"System.SByte",   "sbyte"},
-                            {"System.Byte",    "byte"},
-                            {"System.Int16",   "short"},
-                            {"System.UInt16",  "ushort"},
-                            {"System.Int32",   "int"},
-                            {"System.UInt32",  "uint"},
-                            {"System.Int64",   "long"},
-                            {"System.UInt64",  "ulong"},
-                            {"System.Single",  "float"},
-                            {"System.Double",  "double"},
-                            {"System.String",  "string"},
-                            {"System.Object",  "object"},
-                            {"System.IntPtr",  "IntPtr"},
-                            {"System.UIntPtr", "UIntPtr"},
-                            {nullptr, nullptr}
-                        };
-
-                        for (int i = 0; i < (int)args.size(); i++) {
-                            if (i > 0) result += ", ";
-                            std::string &arg = args[i];
-
-                            std::string type_name_only;
-                            if (!arg.empty() && arg[0] == '[') {
-                                auto comma = arg.find(',');
-                                if (comma != std::string::npos)
-                                    type_name_only = arg.substr(1, comma - 1);
-                                else
-                                    type_name_only = arg.substr(1, arg.size() - 2);
-                            } else {
-                                type_name_only = arg;
-                            }
-
-                            while (!type_name_only.empty() && type_name_only[0] == ' ')
-                                type_name_only = type_name_only.substr(1);
-
-                            bool mapped = false;
-                            for (int j = 0; dotnet_to_csharp[j].dotnet; j++) {
-                                if (type_name_only == dotnet_to_csharp[j].dotnet) {
-                                    result += dotnet_to_csharp[j].csharp;
-                                    mapped = true;
-                                    break;
-                                }
-                            }
-                            if (!mapped) {
-                                auto last_dot = type_name_only.rfind('.');
-                                if (last_dot != std::string::npos)
-                                    result += sanitize_type_name(type_name_only.substr(last_dot + 1));
-                                else
-                                    result += sanitize_type_name(type_name_only);
-                            }
-                        }
-                        result += ">";
-                        return result;
                     }
-                    return sanitize_type_name(class_part);
+                    // no args found — just return class name
+                    return class_part;
                 }
             }
 
+            // fallback: no il2cpp_type_get_name
             klass = il2cpp_class_from_type(type);
             if (!klass) return "?";
-            return sanitize_type_name(get_class_name_no_tick(klass));
+            return get_class_name_no_tick(klass);
         }
 
         case IL2CPP_TYPE_VAR:
@@ -259,7 +298,7 @@ static std::string get_type_name(const Il2CppType *type) {
             klass = il2cpp_class_from_type(type);
             if (!klass) return "T";
             const char *n = il2cpp_class_get_name(klass);
-            return n ? sanitize_type_name(std::string(n)) : "T";
+            return n ? strip_unmatched_brackets(std::string(n)) : "T";
         }
 
         default:
@@ -273,6 +312,7 @@ static std::string get_type_name(const Il2CppType *type) {
     const char *name = il2cpp_class_get_name(klass);
     if (!name) return "?";
 
+    // System namespace primitives by class name
     static const struct { const char *il2cpp_name; const char *csharp_name; } name_map[] = {
         {"Void",          "void"},
         {"Boolean",       "bool"},
@@ -303,7 +343,7 @@ static std::string get_type_name(const Il2CppType *type) {
         }
     }
 
-    return sanitize_type_name(std::string(name));
+    return strip_unmatched_brackets(std::string(name));
 }
 
 std::string get_method_modifier(uint32_t flags) {
@@ -337,9 +377,7 @@ std::string get_method_modifier(uint32_t flags) {
 
 bool _il2cpp_type_is_byref(const Il2CppType *type) {
     auto byref = type->byref;
-    if (il2cpp_type_is_byref) {
-        byref = il2cpp_type_is_byref(type);
-    }
+    if (il2cpp_type_is_byref) byref = il2cpp_type_is_byref(type);
     return byref;
 }
 
@@ -397,12 +435,10 @@ std::string dump_property(Il2CppClass *klass) {
         uint32_t iflags = 0;
         if (get) {
             outPut << get_method_modifier(il2cpp_method_get_flags(get, &iflags));
-            auto ret = il2cpp_method_get_return_type(get);
-            outPut << get_type_name(ret) << " " << prop_name << " { ";
+            outPut << get_type_name(il2cpp_method_get_return_type(get)) << " " << prop_name << " { ";
         } else if (set) {
             outPut << get_method_modifier(il2cpp_method_get_flags(set, &iflags));
-            auto param = il2cpp_method_get_param(set, 0);
-            outPut << get_type_name(param) << " " << prop_name << " { ";
+            outPut << get_type_name(il2cpp_method_get_param(set, 0)) << " " << prop_name << " { ";
         } else {
             if (prop_name) outPut << " // unknown property " << prop_name;
             continue;
@@ -453,24 +489,25 @@ std::string dump_field(Il2CppClass *klass) {
 
 std::string dump_type(const Il2CppType *type, int typeDefIndex) {
     std::stringstream outPut;
-    auto *klass = il2cpp_class_from_type(type);
-    outPut << "\n// Namespace: " << il2cpp_class_get_namespace(klass) << "\n";
-    auto flags       = il2cpp_class_get_flags(klass);
+    auto *klass       = il2cpp_class_from_type(type);
+    auto flags        = il2cpp_class_get_flags(klass);
     auto is_valuetype = il2cpp_class_is_valuetype(klass);
     auto is_enum      = il2cpp_class_is_enum(klass);
+
+    outPut << "\n// Namespace: " << il2cpp_class_get_namespace(klass) << "\n";
 
     if (flags & TYPE_ATTRIBUTE_SERIALIZABLE) outPut << "[Serializable]\n";
 
     auto visibility = flags & TYPE_ATTRIBUTE_VISIBILITY_MASK;
     switch (visibility) {
         case TYPE_ATTRIBUTE_PUBLIC:
-        case TYPE_ATTRIBUTE_NESTED_PUBLIC:       outPut << "public ";            break;
+        case TYPE_ATTRIBUTE_NESTED_PUBLIC:        outPut << "public ";             break;
         case TYPE_ATTRIBUTE_NOT_PUBLIC:
         case TYPE_ATTRIBUTE_NESTED_FAM_AND_ASSEM:
-        case TYPE_ATTRIBUTE_NESTED_ASSEMBLY:     outPut << "internal ";          break;
-        case TYPE_ATTRIBUTE_NESTED_PRIVATE:      outPut << "private ";           break;
-        case TYPE_ATTRIBUTE_NESTED_FAMILY:       outPut << "protected ";         break;
-        case TYPE_ATTRIBUTE_NESTED_FAM_OR_ASSEM: outPut << "protected internal ";break;
+        case TYPE_ATTRIBUTE_NESTED_ASSEMBLY:      outPut << "internal ";           break;
+        case TYPE_ATTRIBUTE_NESTED_PRIVATE:       outPut << "private ";            break;
+        case TYPE_ATTRIBUTE_NESTED_FAMILY:        outPut << "protected ";          break;
+        case TYPE_ATTRIBUTE_NESTED_FAM_OR_ASSEM:  outPut << "protected internal "; break;
     }
 
     if      (flags & TYPE_ATTRIBUTE_ABSTRACT && flags & TYPE_ATTRIBUTE_SEALED)
@@ -491,15 +528,13 @@ std::string dump_type(const Il2CppType *type, int typeDefIndex) {
     auto parent = il2cpp_class_get_parent(klass);
     if (!is_valuetype && !is_enum && parent) {
         auto parent_type = il2cpp_class_get_type(parent);
-        if (parent_type->type != IL2CPP_TYPE_OBJECT) {
+        if (parent_type->type != IL2CPP_TYPE_OBJECT)
             extends.emplace_back(get_type_name(parent_type));
-        }
     }
     void *iter = nullptr;
-    while (auto itf = il2cpp_class_get_interfaces(klass, &iter)) {
-        auto itf_type = il2cpp_class_get_type(itf);
-        extends.emplace_back(get_type_name(itf_type));
-    }
+    while (auto itf = il2cpp_class_get_interfaces(klass, &iter))
+        extends.emplace_back(get_type_name(il2cpp_class_get_type(itf)));
+
     if (!extends.empty()) {
         outPut << " : " << extends[0];
         for (int i = 1; i < (int)extends.size(); ++i)
@@ -520,9 +555,8 @@ void il2cpp_api_init(void *handle) {
     init_il2cpp_api(handle);
     if (il2cpp_domain_get_assemblies) {
         Dl_info dlInfo;
-        if (dladdr((void *)il2cpp_domain_get_assemblies, &dlInfo)) {
+        if (dladdr((void *)il2cpp_domain_get_assemblies, &dlInfo))
             il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        }
         LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
     } else {
         LOGE("Failed to initialize il2cpp api.");
@@ -539,8 +573,9 @@ void il2cpp_api_init(void *handle) {
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
     size_t size;
-    auto domain      = il2cpp_domain_get();
-    auto assemblies  = il2cpp_domain_get_assemblies(domain, &size);
+    auto domain     = il2cpp_domain_get();
+    auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
+
     std::stringstream imageOutput;
     for (int i = 0; i < (int)size; ++i) {
         auto image = il2cpp_assembly_get_image(assemblies[i]);
@@ -560,21 +595,20 @@ void il2cpp_dump(const char *outDir) {
             for (int j = 0; j < (int)classCount; ++j) {
                 auto klass  = il2cpp_image_get_class(image, j);
                 auto type   = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
-                auto outPut = imageStr.str() + dump_type(type, typeDefIndex);
-                outPuts.push_back(outPut);
+                outPuts.push_back(imageStr.str() + dump_type(type, typeDefIndex));
                 typeDefIndex++;
             }
         }
     } else {
         LOGI("Version less than 2018.3");
-        auto corlib          = il2cpp_get_corlib();
-        auto assemblyClass   = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
-        auto assemblyLoad    = il2cpp_class_get_method_from_name(assemblyClass, "Load", 1);
+        auto corlib           = il2cpp_get_corlib();
+        auto assemblyClass    = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
+        auto assemblyLoad     = il2cpp_class_get_method_from_name(assemblyClass, "Load", 1);
         auto assemblyGetTypes = il2cpp_class_get_method_from_name(assemblyClass, "GetTypes", 0);
-        if (!assemblyLoad    || !assemblyLoad->methodPointer)     { LOGI("miss Assembly::Load");     return; }
+        if (!assemblyLoad     || !assemblyLoad->methodPointer)     { LOGI("miss Assembly::Load");     return; }
         if (!assemblyGetTypes || !assemblyGetTypes->methodPointer) { LOGI("miss Assembly::GetTypes"); return; }
 
-        typedef void       *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
+        typedef void        *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
         typedef Il2CppArray *(*Assembly_GetTypes_ftn)(void *, void *);
 
         for (int i = 0; i < (int)size; ++i) {
@@ -582,18 +616,17 @@ void il2cpp_dump(const char *outDir) {
             std::stringstream imageStr;
             auto image_name = il2cpp_image_get_name(image);
             imageStr << "\n// Dll : " << image_name;
-            auto imageName      = std::string(image_name);
-            auto pos            = imageName.rfind('.');
-            auto imageNameNoExt = imageName.substr(0, pos);
-            auto assemblyFileName  = il2cpp_string_new(imageNameNoExt.data());
+            auto imageName       = std::string(image_name);
+            auto pos             = imageName.rfind('.');
+            auto imageNameNoExt  = imageName.substr(0, pos);
+            auto assemblyFileName   = il2cpp_string_new(imageNameNoExt.data());
             auto reflectionAssembly = ((Assembly_Load_ftn)assemblyLoad->methodPointer)(nullptr, assemblyFileName, nullptr);
             auto reflectionTypes    = ((Assembly_GetTypes_ftn)assemblyGetTypes->methodPointer)(reflectionAssembly, nullptr);
             auto items = reflectionTypes->vector;
             for (int j = 0; j < (int)reflectionTypes->max_length; ++j) {
                 auto klass  = il2cpp_class_from_system_type((Il2CppReflectionType *)items[j]);
                 auto type   = il2cpp_class_get_type(klass);
-                auto outPut = imageStr.str() + dump_type(type, typeDefIndex);
-                outPuts.push_back(outPut);
+                outPuts.push_back(imageStr.str() + dump_type(type, typeDefIndex));
                 typeDefIndex++;
             }
         }
