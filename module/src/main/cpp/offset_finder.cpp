@@ -93,7 +93,7 @@ void find_transform_offsets(const char *outDir) {
     LOGI("[OffsetFinder] classes found");
 
     // ══════════════════════════════════════════
-    // Step 3: Wait for Camera.main to be ready
+    // Step 3: Wait FOREVER until Camera.main is ready AND in-game
     // ══════════════════════════════════════════
     auto getMain = il2cpp_class_get_method_from_name(cameraClass, "get_main", 0);
     if (!getMain) {
@@ -102,28 +102,51 @@ void find_transform_offsets(const char *outDir) {
     }
 
     Il2CppObject *mainCam = nullptr;
-    int maxRetries = 120; // 4 minutes total (2 sec × 120)
+    int waitedSeconds = 0;
 
-    for (int retry = 0; retry < maxRetries; retry++) {
+    while (true) {
         Il2CppException *exc = nullptr;
         mainCam = il2cpp_runtime_invoke(getMain, nullptr, nullptr, &exc);
-    
+        
         if (mainCam && !exc) {
-            LOGI("[OffsetFinder] Camera.main ready after %d seconds", retry * 2);
-            break;
+            // Camera موجودة — نتحقق أنها فعلياً في game (position != 0)
+            auto getPos = il2cpp_class_get_method_from_name(transformClass, "get_position", 0);
+            auto getTransformMethod = il2cpp_class_get_method_from_name(cameraClass, "get_transform", 0);
+            
+            if (getTransformMethod && getPos) {
+                exc = nullptr;
+                auto tmpTransform = il2cpp_runtime_invoke(getTransformMethod, mainCam, nullptr, &exc);
+                
+                if (tmpTransform && !exc) {
+                    exc = nullptr;
+                    auto tmpPosBoxed = il2cpp_runtime_invoke(getPos, tmpTransform, nullptr, &exc);
+                    
+                    if (tmpPosBoxed && !exc) {
+                        Vec3 tmpPos = *(Vec3 *)il2cpp_object_unbox(tmpPosBoxed);
+                        
+                        // شرط: position مش (0,0,0) يعني فعلياً في game
+                        if (std::abs(tmpPos.x) > 0.5f || 
+                            std::abs(tmpPos.y) > 0.5f || 
+                            std::abs(tmpPos.z) > 0.5f)
+                        {
+                            LOGI("[OffsetFinder] Ready! Camera at (%.2f, %.2f, %.2f) after %d sec",
+                                 tmpPos.x, tmpPos.y, tmpPos.z, waitedSeconds);
+                            break; // خرج من اللوب — جاهزين
+                        }
+                    }
+                }
+            }
         }
-    
-        if (retry % 10 == 0) {
-            LOGI("[OffsetFinder] waiting for Camera.main... (%d/%d)", retry, maxRetries);
+        
+        // log كل 30 ثانية
+        if (waitedSeconds % 30 == 0) {
+            LOGI("[OffsetFinder] still waiting for game... (%d sec elapsed)", waitedSeconds);
         }
+        
         sleep(2);
+        waitedSeconds += 2;
     }
-
-    if (!mainCam) {
-        LOGE("[OffsetFinder] Camera.main never became available");
-        return;
-    }
-
+    
     // ══════════════════════════════════════════
     // Step 4: Get Camera.main.transform
     // ══════════════════════════════════════════
