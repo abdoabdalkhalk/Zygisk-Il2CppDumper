@@ -8,6 +8,8 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <elf.h>
+#include <link.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -18,6 +20,7 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+static uint64_t il2cpp_offset_bias = 0; // load_bias - file_offset_of_first_load_segment
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -30,12 +33,65 @@ void init_il2cpp_api(void *handle) {
 #undef DO_API
 }
 
+// --------------------------------------------------------
+// hex helpers
+// --------------------------------------------------------
 static std::string to_hex(uint64_t val) {
     std::stringstream ss;
     ss << std::hex << std::uppercase << val;
     return ss.str();
 }
 
+// escape a string for JSON
+static std::string json_escape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04X", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+// --------------------------------------------------------
+// compute file Offset from VA
+// VA → RVA = VA - il2cpp_base
+// Offset = RVA - (p_vaddr - p_offset) of the containing PT_LOAD
+// We parse ELF in-memory at il2cpp_base to find the right segment.
+// --------------------------------------------------------
+static uint64_t va_to_offset(uint64_t va) {
+    if (va == 0 || il2cpp_base == 0) return 0;
+    const ElfW(Ehdr) *ehdr = (const ElfW(Ehdr) *)il2cpp_base;
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return 0;
+    const ElfW(Phdr) *phdr = (const ElfW(Phdr) *)(il2cpp_base + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint64_t seg_va_start = il2cpp_base + phdr[i].p_vaddr;
+        uint64_t seg_va_end   = seg_va_start + phdr[i].p_filesz;
+        if (va >= seg_va_start && va < seg_va_end) {
+            return (va - seg_va_start) + phdr[i].p_offset;
+        }
+    }
+    return va - il2cpp_base; // fallback: treat as RVA
+}
+
+// --------------------------------------------------------
+// type name resolution
+// --------------------------------------------------------
 static std::string get_type_name(const Il2CppType *type);
 
 static const char* primitive_type_name(int t) {
@@ -149,17 +205,14 @@ static std::string get_type_name(const Il2CppType *type) {
         case IL2CPP_TYPE_GENERICINST: {
             Il2CppGenericClass *gclass = type->data.generic_class;
             if (!gclass) break;
-
             const Il2CppType *gtype = gclass->type;
             Il2CppClass *def_klass = nullptr;
             if (gtype) def_klass = il2cpp_class_from_type(gtype);
             if (!def_klass) def_klass = il2cpp_class_from_type(type);
             if (!def_klass) return "?";
-
-            std::string full = get_class_fullname(def_klass);
+            std::string full   = get_class_fullname(def_klass);
             std::string mapped = map_system_type(full);
-            std::string base = mapped.empty() ? get_class_name_clean(def_klass) : mapped;
-
+            std::string base   = mapped.empty() ? get_class_name_clean(def_klass) : mapped;
             const Il2CppGenericInst *inst = gclass->context.class_inst;
             if (inst && inst->type_argc > 0 && inst->type_argv) {
                 base += "<";
@@ -176,10 +229,7 @@ static std::string get_type_name(const Il2CppType *type) {
         case IL2CPP_TYPE_VAR:
         case IL2CPP_TYPE_MVAR: {
             Il2CppClass *k = il2cpp_class_from_type(type);
-            if (k) {
-                const char *n = il2cpp_class_get_name(k);
-                if (n) return n;
-            }
+            if (k) { const char *n = il2cpp_class_get_name(k); if (n) return n; }
             return "T";
         }
 
@@ -187,22 +237,33 @@ static std::string get_type_name(const Il2CppType *type) {
         case IL2CPP_TYPE_VALUETYPE: {
             Il2CppClass *k = il2cpp_class_from_type(type);
             if (!k) return "?";
-            std::string full = get_class_fullname(k);
+            std::string full   = get_class_fullname(k);
             std::string mapped = map_system_type(full);
             return mapped.empty() ? get_class_name_clean(k) : mapped;
         }
 
-        default:
-            break;
+        default: break;
     }
 
     Il2CppClass *k = il2cpp_class_from_type(type);
     if (!k) return "?";
-    std::string full = get_class_fullname(k);
+    std::string full   = get_class_fullname(k);
     std::string mapped = map_system_type(full);
     return mapped.empty() ? get_class_name_clean(k) : mapped;
 }
 
+// --------------------------------------------------------
+// script.json entry
+// --------------------------------------------------------
+struct ScriptMethod {
+    uint64_t address; // RVA
+    std::string name;
+    std::string signature;
+};
+
+// --------------------------------------------------------
+// modifiers
+// --------------------------------------------------------
 std::string get_method_modifier(uint32_t flags) {
     std::stringstream ss;
     switch (flags & METHOD_ATTRIBUTE_MEMBER_ACCESS_MASK) {
@@ -236,24 +297,71 @@ bool _il2cpp_type_is_byref(const Il2CppType *type) {
     return type->byref;
 }
 
-std::string dump_method(Il2CppClass *klass) {
+// --------------------------------------------------------
+// build full method signature string (for script.json)
+// --------------------------------------------------------
+static std::string build_method_signature(
+        Il2CppClass *klass,
+        const MethodInfo *method,
+        uint32_t flags) {
+
+    std::stringstream sig;
+    sig << get_method_modifier(flags);
+
+    auto ret = il2cpp_method_get_return_type(method);
+    if (_il2cpp_type_is_byref(ret)) sig << "ref ";
+    sig << get_type_name(ret) << " ";
+
+    // ClassName$$MethodName
+    sig << get_class_name_clean(klass) << "$$" << il2cpp_method_get_name(method) << "(";
+
+    int pc = il2cpp_method_get_param_count(method);
+    for (int i = 0; i < pc; i++) {
+        auto p = il2cpp_method_get_param(method, i);
+        auto a = p->attrs;
+        if (_il2cpp_type_is_byref(p)) {
+            if      (a & PARAM_ATTRIBUTE_OUT && !(a & PARAM_ATTRIBUTE_IN)) sig << "out ";
+            else if (a & PARAM_ATTRIBUTE_IN  && !(a & PARAM_ATTRIBUTE_OUT)) sig << "in ";
+            else sig << "ref ";
+        }
+        sig << get_type_name(p);
+        const char *pname = il2cpp_method_get_param_name(method, i);
+        if (pname) sig << " " << pname;
+        if (i < pc - 1) sig << ", ";
+    }
+    sig << ") { }";
+    return sig.str();
+}
+
+// --------------------------------------------------------
+// dump methods — fills dump.cs section AND collects script entries
+// --------------------------------------------------------
+std::string dump_method(Il2CppClass *klass, std::vector<ScriptMethod> &script_methods) {
     std::stringstream out;
     out << "\n\t// Methods\n";
     void *iter = nullptr;
     while (auto method = il2cpp_class_get_methods(klass, &iter)) {
-        if (method->methodPointer) {
-            out << "\t// RVA: 0x" << to_hex((uint64_t)method->methodPointer - il2cpp_base)
-                << " VA: 0x"      << to_hex((uint64_t)method->methodPointer);
+        uint64_t va  = (uint64_t)method->methodPointer;
+        uint64_t rva = va ? (va - il2cpp_base) : 0;
+        uint64_t off = va ? va_to_offset(va)    : 0;
+
+        if (va) {
+            out << "\t// RVA: 0x" << to_hex(rva)
+                << " Offset: 0x" << to_hex(off)
+                << " VA: 0x"     << to_hex(va);
         } else {
-            out << "\t// RVA: 0x VA: 0x0";
+            out << "\t// RVA: 0x Offset: 0x VA: 0x0";
         }
         out << "\n\t";
+
         uint32_t iflags = 0;
-        uint32_t flags = il2cpp_method_get_flags(method, &iflags);
+        uint32_t flags  = il2cpp_method_get_flags(method, &iflags);
         out << get_method_modifier(flags);
+
         auto ret = il2cpp_method_get_return_type(method);
         if (_il2cpp_type_is_byref(ret)) out << "ref ";
         out << get_type_name(ret) << " " << il2cpp_method_get_name(method) << "(";
+
         int pc = il2cpp_method_get_param_count(method);
         for (int i = 0; i < pc; i++) {
             auto p = il2cpp_method_get_param(method, i);
@@ -270,6 +378,15 @@ std::string dump_method(Il2CppClass *klass) {
             if (i < pc - 1) out << ", ";
         }
         out << ") { }\n";
+
+        // collect for script.json — only methods with real pointers
+        if (va) {
+            ScriptMethod sm;
+            sm.address   = rva;
+            sm.name      = get_class_name_clean(klass) + std::string("$$") + il2cpp_method_get_name(method);
+            sm.signature = build_method_signature(klass, method, flags);
+            script_methods.push_back(std::move(sm));
+        }
     }
     return out.str();
 }
@@ -307,7 +424,7 @@ std::string dump_field(Il2CppClass *klass) {
     std::stringstream out;
     out << "\n\t// Fields\n";
     bool is_enum = il2cpp_class_is_enum(klass);
-    void *iter = nullptr;
+    void *iter   = nullptr;
     while (auto field = il2cpp_class_get_fields(klass, &iter)) {
         out << "\t";
         uint32_t attrs = il2cpp_field_get_flags(field);
@@ -335,7 +452,8 @@ std::string dump_field(Il2CppClass *klass) {
     return out.str();
 }
 
-std::string dump_type(const Il2CppType *type, int typeDefIndex) {
+std::string dump_type(const Il2CppType *type, int typeDefIndex,
+                      std::vector<ScriptMethod> &script_methods) {
     std::stringstream out;
     auto *klass = il2cpp_class_from_type(type);
     out << "\n// Namespace: " << il2cpp_class_get_namespace(klass) << "\n";
@@ -380,11 +498,39 @@ std::string dump_type(const Il2CppType *type, int typeDefIndex) {
     out << " // TypeDefIndex: " << typeDefIndex << "\n{";
     out << dump_field(klass);
     out << dump_property(klass);
-    out << dump_method(klass);
+    out << dump_method(klass, script_methods);
     out << "}\n";
     return out.str();
 }
 
+// --------------------------------------------------------
+// write script.json
+// --------------------------------------------------------
+static void write_script_json(const std::string &outDir,
+                              const std::vector<ScriptMethod> &methods) {
+    std::string path = outDir + "/files/script.json";
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"ScriptMethod\": [\n";
+    for (size_t i = 0; i < methods.size(); i++) {
+        const auto &m = methods[i];
+        f << "    {";
+        f << "\"Address\": " << m.address << ", ";
+        f << "\"Name\": \""  << json_escape(m.name) << "\", ";
+        f << "\"Signature\": \"" << json_escape(m.signature) << "\"";
+        f << "}";
+        if (i + 1 < methods.size()) f << ",";
+        f << "\n";
+    }
+    f << "  ]\n";
+    f << "}\n";
+    f.close();
+    LOGI("script.json done! methods: %zu", methods.size());
+}
+
+// --------------------------------------------------------
+// public API
+// --------------------------------------------------------
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
@@ -401,7 +547,7 @@ void il2cpp_api_init(void *handle) {
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
     size_t size;
-    auto domain = il2cpp_domain_get();
+    auto domain     = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
 
     std::stringstream header;
@@ -409,19 +555,22 @@ void il2cpp_dump(const char *outDir) {
         header << "// Image " << i << ": "
                << il2cpp_image_get_name(il2cpp_assembly_get_image(assemblies[i])) << "\n";
 
-    std::vector<std::string> lines;
+    std::vector<std::string>  lines;
+    std::vector<ScriptMethod> script_methods;
     int idx = 0;
 
     if (il2cpp_image_get_class) {
         LOGI("Version greater than 2018.3");
         for (int i = 0; i < (int)size; i++) {
-            auto img = il2cpp_assembly_get_image(assemblies[i]);
+            auto img   = il2cpp_assembly_get_image(assemblies[i]);
             std::string ih = std::string("\n// Dll : ") + il2cpp_image_get_name(img);
-            size_t count = il2cpp_image_get_class_count(img);
+            size_t count   = il2cpp_image_get_class_count(img);
+            LOGI("Dumping image %d/%d: %s (%zu classes)", i + 1, (int)size,
+                 il2cpp_image_get_name(img), count);
             for (int j = 0; j < (int)count; j++) {
                 auto klass = const_cast<Il2CppClass *>(il2cpp_image_get_class(img, j));
                 auto type  = il2cpp_class_get_type(klass);
-                lines.push_back(ih + dump_type(type, idx++));
+                lines.push_back(ih + dump_type(type, idx++, script_methods));
             }
         }
     } else {
@@ -437,10 +586,10 @@ void il2cpp_dump(const char *outDir) {
         typedef Il2CppArray *(*GetTypesFn)(void *, void *);
 
         for (int i = 0; i < (int)size; i++) {
-            auto img        = il2cpp_assembly_get_image(assemblies[i]);
-            std::string ih  = std::string("\n// Dll : ") + il2cpp_image_get_name(img);
-            auto nameNoExt  = std::string(il2cpp_image_get_name(img));
-            auto dot        = nameNoExt.rfind('.');
+            auto img       = il2cpp_assembly_get_image(assemblies[i]);
+            std::string ih = std::string("\n// Dll : ") + il2cpp_image_get_name(img);
+            auto nameNoExt = std::string(il2cpp_image_get_name(img));
+            auto dot       = nameNoExt.rfind('.');
             if (dot != std::string::npos) nameNoExt = nameNoExt.substr(0, dot);
             auto str        = il2cpp_string_new(nameNoExt.c_str());
             auto asmObj     = ((LoadFn)loadMethod->methodPointer)(nullptr, str, nullptr);
@@ -449,15 +598,20 @@ void il2cpp_dump(const char *outDir) {
             for (int j = 0; j < (int)typesArray->max_length; j++) {
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *)items[j]);
                 auto type  = il2cpp_class_get_type(klass);
-                lines.push_back(ih + dump_type(type, idx++));
+                lines.push_back(ih + dump_type(type, idx++, script_methods));
             }
         }
     }
 
-    std::string path = std::string(outDir) + "/files/dump.cs";
-    std::ofstream f(path);
-    f << header.str();
-    for (auto &l : lines) f << l;
-    f.close();
-    LOGI("dump done!");
+    LOGI("writing dump.cs ...");
+    {
+        std::string path = std::string(outDir) + "/files/dump.cs";
+        std::ofstream f(path);
+        f << header.str();
+        for (auto &l : lines) f << l;
+        f.close();
+    }
+    LOGI("dump.cs done! classes: %d", idx);
+
+    write_script_json(std::string(outDir), script_methods);
 }
