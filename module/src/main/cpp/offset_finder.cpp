@@ -74,7 +74,7 @@ void find_transform_offsets(const char *outDir) {
     // ══════════════════════════════════════════
     // Step 1: Wait for game to be ready
     // ══════════════════════════════════════════
-    sleep(60); // wait for game scene to load
+    sleep(20); // wait for game scene to load
 
     auto domain = il2cpp_domain_get();
     il2cpp_thread_attach(domain);
