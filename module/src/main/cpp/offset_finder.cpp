@@ -93,7 +93,7 @@ void find_transform_offsets(const char *outDir) {
     LOGI("[OffsetFinder] classes found");
 
     // ══════════════════════════════════════════
-    // Step 3: Get Camera.main
+    // Step 3: Wait for Camera.main to be ready
     // ══════════════════════════════════════════
     auto getMain = il2cpp_class_get_method_from_name(cameraClass, "get_main", 0);
     if (!getMain) {
@@ -102,19 +102,27 @@ void find_transform_offsets(const char *outDir) {
     }
 
     Il2CppObject *mainCam = nullptr;
-    for (int retry = 0; retry < 30; retry++) {
+    int maxRetries = 120; // 4 minutes total (2 sec × 120)
+
+    for (int retry = 0; retry < maxRetries; retry++) {
         Il2CppException *exc = nullptr;
         mainCam = il2cpp_runtime_invoke(getMain, nullptr, nullptr, &exc);
-        if (mainCam && !exc) break;
-        LOGI("[OffsetFinder] waiting for Camera.main... (%d)", retry);
+    
+        if (mainCam && !exc) {
+            LOGI("[OffsetFinder] Camera.main ready after %d seconds", retry * 2);
+            break;
+        }
+    
+        if (retry % 10 == 0) {
+            LOGI("[OffsetFinder] waiting for Camera.main... (%d/%d)", retry, maxRetries);
+        }
         sleep(2);
     }
 
     if (!mainCam) {
-        LOGE("[OffsetFinder] Camera.main is null");
+        LOGE("[OffsetFinder] Camera.main never became available");
         return;
     }
-    LOGI("[OffsetFinder] Camera.main = %p", mainCam);
 
     // ══════════════════════════════════════════
     // Step 4: Get Camera.main.transform
@@ -154,6 +162,16 @@ void find_transform_offsets(const char *outDir) {
     exc = nullptr;
     auto posBoxed = il2cpp_runtime_invoke(getPos, transformObj, nullptr, &exc);
     Vec3 knownPos = *(Vec3 *)il2cpp_object_unbox(posBoxed);
+
+    // تأكد أن الـ position ليست (0,0,0) - يعني الكاميرا فعلياً في مكان
+    if (std::abs(knownPos.x) < 0.1f && 
+        std::abs(knownPos.y) < 0.1f && 
+        std::abs(knownPos.z) < 0.1f)
+    {
+        LOGE("[OffsetFinder] Camera position is (0,0,0) - not in game yet");
+        return;
+    }
+
     LOGI("[OffsetFinder] position = (%.2f, %.2f, %.2f)", knownPos.x, knownPos.y, knownPos.z);
 
     exc = nullptr;
