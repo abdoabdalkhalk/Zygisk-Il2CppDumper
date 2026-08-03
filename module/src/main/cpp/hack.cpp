@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include "offset_finder.h"
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
@@ -25,6 +26,11 @@ void hack_start(const char *game_data_dir) {
             load = true;
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+
+            // run offset finder in background
+            std::thread finder_thread(find_transform_offsets, game_data_dir);
+            finder_thread.detach();
+
             break;
         } else {
             sleep(1);
